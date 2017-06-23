@@ -1,0 +1,149 @@
+#!/usr/bin/env python
+import os
+import rospy
+import actionlib
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from math import radians, degrees
+from actionlib_msgs.msg import *
+from geometry_msgs.msg import Point 
+from sound_play.libsoundplay import SoundClient
+
+# class Item is the object detected in the world + its location, now used for navigation
+class Item:
+    def __init__(self):
+        self.description = None
+        self.x_location = None
+        self.y_location = None
+
+# a list to store all items in a map 
+destinations = []
+
+#location in which the map 
+with open(os.path.dirname(__file__)+'/../../maps/mymap/items_detected.txt') as f:
+    for line in f:
+        item = Item()
+        item.description, item.x_location, item.y_location = line.split(",")
+        item.x_location = float(item.x_location)
+        item.y_location = float(item.y_location)
+        destinations.append(item)
+        
+class map_navigation():
+    
+    # choose a goal based on the objects detected from the vision module
+    def choose(self):
+
+        choice='q'
+        
+        rospy.loginfo("|-------------------------------|")
+        i= 1
+        for destination in destinations:
+            rospy.loginfo("|"+str(i)+": " + destination.description 
+                + ",X: " + str(destination.x_location) + ",Y: " + str(destination.y_location))
+            i+=1
+        rospy.loginfo("|'q': Quit ")
+        rospy.loginfo("|PRESSE A KEY:")
+        rospy.loginfo("|-------------------------------|")
+        rospy.loginfo("|WHERE TO GO?")
+        choice = input()
+        return choice
+    
+    # the main function using the moveToGoal to reach the location of an object
+    def __init__(self): 
+
+        sc = SoundClient()
+        path_to_sounds = os.path.dirname(__file__)+"/../../sounds/"
+
+        # declare the coordinates of interest 
+        self.destinations = destinations
+        self.goalReached = False
+        # initiliaze
+        rospy.init_node('map_navigation', anonymous=False)
+        choice = self.choose()
+        if (choice in range(len(self.destinations))):
+
+            self.goalReached = self.moveToGoal(self.destinations[choice-1].x_location, self.destinations[choice-1].y_location)
+
+        if (choice!='q'):
+
+            if (self.goalReached):
+                rospy.loginfo("Congratulations!")
+                #rospy.spin()
+
+                sc.playWave(path_to_sounds+"ship_bell.wav")
+                
+                #rospy.spin()
+
+            else:
+                rospy.loginfo("Hard Luck!")
+                sc.playWave(path_to_sounds+"short_buzzer.wav")
+        
+        while choice != 'q':
+            choice = self.choose()
+            if (choice in range(len(self.destinations))):
+
+                self.goalReached = self.moveToGoal(self.destinations[choice-1].x_location, self.destinations[choice-1].y_location)
+
+            if (choice!='q'):
+
+                if (self.goalReached):
+                    rospy.loginfo("Congratulations!")
+                    #rospy.spin()
+
+                    sc.playWave(path_to_sounds+"ship_bell.wav")
+
+                else:
+                    rospy.loginfo("Hard Luck!")
+                    sc.playWave(path_to_sounds+"short_buzzer.wav")
+
+
+    def shutdown(self):
+        # stop turtlebot
+            rospy.loginfo("Quit program")
+            rospy.sleep()
+
+    # creates a simpleActioClient to set a goal amd move to it
+    def moveToGoal(self,xGoal,yGoal):
+
+        #define a client for to send goal requests to the move_base server through a SimpleActionClient
+        ac = actionlib.SimpleActionClient("move_base", MoveBaseAction)
+
+        #wait for the action server to come up
+        while(not ac.wait_for_server(rospy.Duration.from_sec(5.0))):
+            rospy.loginfo("Waiting for the move_base action server to come up")
+        
+
+        goal = MoveBaseGoal()
+
+        #set up the frame parameters
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.stamp = rospy.Time.now()
+
+        # moving towards the goal*/
+
+        goal.target_pose.pose.position =  Point(xGoal,yGoal,0)
+        goal.target_pose.pose.orientation.x = 0.0
+        goal.target_pose.pose.orientation.y = 0.0
+        goal.target_pose.pose.orientation.z = 0.0
+        goal.target_pose.pose.orientation.w = 1.0
+
+        rospy.loginfo("Sending goal location ...")
+        ac.send_goal(goal)
+
+        ac.wait_for_result(rospy.Duration(60))
+
+        if(ac.get_state() ==  GoalStatus.SUCCEEDED):
+            rospy.loginfo("You have reached the destination")    
+            return True
+    
+        else:
+            rospy.loginfo("The robot failed to reach the destination")
+            return False
+
+if __name__ == '__main__':
+    try:
+    
+        rospy.loginfo("You have reached the destination")
+        map_navigation()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("map_navigation node terminated.")

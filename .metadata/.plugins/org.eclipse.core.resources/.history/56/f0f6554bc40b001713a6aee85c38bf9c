@@ -1,0 +1,264 @@
+#!/usr/bin/env python
+
+import roslib
+import sys
+import rospy
+import binascii
+import math
+import numpy as np
+import cv2
+import io
+import os
+import warnings
+from std_msgs.msg import String
+from nav_msgs.msg import Odometry, OccupancyGrid
+from geometry_msgs.msg import Point 
+from sensor_msgs.msg import LaserScan, Image, PointCloud2, PointField
+import sensor_msgs.point_cloud2 as pc2
+from google.cloud import vision
+from google.cloud.vision.feature import Feature
+from google.cloud.vision.feature import FeatureTypes
+from cv_bridge import CvBridge, CvBridgeError
+import Image as mig
+
+# Google vision client to enable image recognition
+client = vision.Client()
+
+#list in which to store detected objects from world
+objects_detected=[]
+
+
+# class Item is the object detected in the world + its location
+class Item:
+    def __init__(self):
+        self.description = None
+        self.x_location = None
+        self.y_location = None
+
+# LabelDetector is the main class detecting objects in the world
+class LabelDetector:
+    def __init__(self):
+        self.odometry = None
+        self.receivedNewOdometry = False
+        self.depthImage = None
+        self.receivedNewDepthImage = False
+        self.image = None
+        self.receivedNewImage = False
+        self.points = None
+        self.receivedNewPoints = False
+   
+    #Callback function that processes the Image message.
+    def image_callback(self, image_msg):
+
+        bridge = CvBridge()
+        self.image = bridge.imgmsg_to_cv2(image_msg, "rgb8")
+        self.receivedNewImage = True
+    
+    #Callback function that processes the Odometry message.
+    def odom_callback(self, odom_msg):
+    
+        self.odometry = odom_msg
+        self.receivedNewOdometry = True
+    
+    #Callback function that processes the Depth message. 
+    #!! Currently not in use as new implementation found using PointCloud data
+    def depth_callback(self, depth_msg):
+        self.depthImage=depth_msg
+        self.receivedNewDepthImage = True
+     
+    #Callback function that processes the PointCloud message.
+    def point_callback(self, point_msg):
+
+        self.points = point_msg
+        self.receivedNewPoints = True
+       
+    #get single moment data to process and label objects
+    def get_moment_data(self):
+        if self.receivedNewImage:
+            rgb_image = self.image
+        else:
+            rospy.loginfo("RGB image not received")
+        if self.receivedNewDepthImage:
+            depth_image = self.depthImage
+        else:
+            rospy.loginfo("Depth image not received")
+        if self.receivedNewOdometry:
+            odometry_data = self.odometry
+        else:
+            rospy.loginfo("Odometry data not received")
+        if self.receivedNewPoints:
+            points = self.points
+        else:
+            rospy.loginfo("Odometry data not received")
+        return [rgb_image,depth_image,odometry_data, points]
+    
+    #function to get distance measurements from depth image
+    def get_distance(self, depth_img):
+        bridge=CvBridge()
+        cv_depth_image = bridge.imgmsg_to_cv2(depth_img)
+        return cv_depth_image 
+    
+    #function to extract x,y,z points of objects 
+    def get_point_data(self, points):
+        point_list = []
+        for p in pc2.read_points(points, field_names = ("x", "y", "z")):  
+            point_list.append((p[0],p[1],p[2]))
+        point_array = np.array(point_list)
+        point_3d_array = np.reshape(point_array, (480,640,3)) 
+        return point_3d_array
+    
+    #get the bounding box of an object, and its centre pixel, in an image in order to label it and find its position  
+    def get_object_boundingbox(self, rgb_image):
+
+        imgray = cv2.cvtColor(rgb_image,cv2.COLOR_RGB2GRAY)
+        
+        img_filt = cv2.medianBlur(imgray, 5)
+        img_th = cv2.adaptiveThreshold(img_filt,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,7,2)
+        contours, hierarchy = cv2.findContours(img_th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        sortedContours = sorted(contours, key =cv2.contourArea, reverse = True)
+        largestContours = sortedContours[0:2]
+        contourCentres = {}
+        contourNumber = 1
+        img = rgb_image
+        for contour in largestContours:
+            x,y,w,h = cv2.boundingRect(contour)
+            contourCentres[contourNumber]=[(x+w)/2,(y+h)/2, w,h]
+            contourNumber+=1
+            #cv2.rectangle(img,(x,y),(x+w,y+h),(0,255,0),2)
+        return contourCentres
+        
+    #get the object distances from the robot    
+    def get_object_data(self, rgb_image, depth_image,points):
+        object_images=[]
+        object_distances=[]
+        object_point_distances=[]
+        depth_img = self.get_distance(depth_image)
+        points = self.get_point_data(points)
+        objects = self.get_object_boundingbox(rgb_image)
+        for object in objects:
+            
+            object_image = rgb_image[objects[object][0]
+                                        -objects[object][2]/2:objects[object][0]
+                                        +objects[object][2]/2 , objects[object][1]
+                                        -objects[object][3]/2:objects[object][1]
+                                        +objects[object][3]/2, :]
+
+            point_distance = points[objects[object][0]-
+                                        10:objects[object][0]+10,objects[object][1]-10:objects[object][1]+10]
+            
+            object_distance_im = depth_img[objects[object][0]-
+                                        10:objects[object][0]+10,objects[object][1]-10:objects[object][1]+10]
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                average_distance = np.nanmean(object_distance_im)/1000
+            
+            point_distance_x = []
+            point_distance_y = []
+            point_distance_z = []
+            for i in range(point_distance.shape[0]):
+                for j in range(point_distance.shape[1]):
+                    point_distance_x.append(point_distance[i][j][0])
+                    point_distance_y.append(point_distance[i][j][1])
+                    point_distance_z.append(point_distance[i][j][2])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                point_average_x = np.nanmean(np.array(point_distance_x))
+                point_average_y = np.nanmean(np.array(point_distance_y))
+                point_average_z = np.nanmean(np.array(point_distance_z))
+            if math.isnan(point_average_x) or math.isnan(point_average_y) or math.isnan(point_average_z):
+                break  
+            
+            object_images.append(object_image)
+            object_distances.append(average_distance)
+            object_point_distances.append([point_average_x,point_average_y,point_average_z]) 
+        
+        
+        return object_images, object_distances,object_point_distances
+        
+    #The function that uses the google api to recognise objects from images
+    def process_image(self,rgb_image):
+        
+        object_description = []
+        bytes = rgb_image.tobytes()
+        im = mig.fromarray(rgb_image)
+        imgByteArr = io.BytesIO()
+        im.save(imgByteArr, format='PNG')
+        imgByteArr = imgByteArr.getvalue() 
+        image = client.image(content = imgByteArr)
+        features =[Feature(FeatureTypes.LABEL_DETECTION, 1),
+                   Feature(FeatureTypes.FACE_DETECTION,1)]
+        annotations = image.detect(features)
+        for annotation in annotations:
+            for label in annotation.labels:
+                object_description.append([label.description, label.score])
+        return object_description
+               
+    #compute the object's location on the map + check if object is already on the map storage list
+    def detect_objects(self):
+        item = Item()
+        # gets the most current data from the robot topics (image,odometry,depth,pointcloud)
+        data = self.get_moment_data() 
+        # the current position of the robot
+        x_position = self.odometry.pose.pose.position.x
+        y_position = self.odometry.pose.pose.position.y
+        z_position = self.odometry.pose.pose.position.z
+        #the processed data to get the objects
+        object_images, object_distances, object_point_distances = self.get_object_data(data[0],data[1],data[3])
+        
+        for i in range (len(object_images)):
+            # get the object description from object_images and its location
+            print object_images[i].shape
+            item.description = self.process_image(object_images[i])[0][0]
+            item.x_location = x_position+object_point_distances[i][0]
+            item.y_location = y_position+object_point_distances[i][1]
+            #flag to check dupicate items based on their location
+            duplicate_found = False
+            #the radius in which similar objects should not be added to the list
+            radius = 0.3
+            for detected_item in objects_detected:
+                #if item.description == detected_item.description and \
+                #item.x_location >= detected_item.x_location-0.30 and item.x_location <= detected_item.x_location+0.30 and \
+                #item.y_location >= detected_item.y_location-0.30 and item.y_location <= detected_item.y_location+0.30:
+                #   duplicate_found = True
+                #   rospy.loginfo("found duplicate Item: " + item.description)
+                #   break
+                if item.description == detected_item.description and \
+                (np.power(item.x_location-detected_item.x_location, 2) + np.power(item.y_location-detected_item.y_location,2))<=np.power(radius,2):
+                    duplicate_found = True
+                    rospy.loginfo("found duplicate Item: " + item.description)
+                    break
+                
+            if not duplicate_found:
+                objects_detected.append(item)
+                rospy.loginfo("found new Item: " + str(item.description) + " at " + str(item.x_location) + ", " + str(item.y_location) + " location") 
+        return objects_detected 
+        
+    # store the labels and locations of the objects on the map in a file to be used by the navigation module   
+    def store_image(self):    
+        rospy.loginfo("Storing items to file")
+        item_file = open(os.path.dirname(__file__)+"/../../../maps/items_detected.txt","w")
+        for item in objects_detected:
+            item_file.write("%s, %f, %f\n" %(item.description, item.x_location, item.y_location))
+
+    # stop module
+    def shutdown(self):
+        rospy.loginfo("Quit program")
+        rospy.sleep()
+            
+if __name__== '__main__':
+
+    ld = LabelDetector()
+    rospy.init_node("turtlebot_vision")
+    image_sub = rospy.Subscriber("/camera/rgb/image_raw", Image , ld.image_callback)
+    odom_sub = rospy.Subscriber("/odom", Odometry, ld.odom_callback)
+    laser_sub = rospy.Subscriber("/camera/depth/image_raw", Image, ld.depth_callback)
+    point_sub = rospy.Subscriber("/camera/depth/points", PointCloud2, ld.point_callback)
+    rospy.sleep(2.0)
+    rospy.loginfo("Starting Object Detection.")
+    while not rospy.is_shutdown():
+        objects = ld.detect_objects()
+    ld.store_image()  
+    rospy
+    rospy.spin()
